@@ -124,7 +124,6 @@ def login():
     token = Token(3600, data['username'])
     with token_lock:
         token_table[data['username']] = token
-
     return json.dumps({'server_generated_public_key': public_key_string, 'token': token.value})
 
 
@@ -139,12 +138,16 @@ def send_message():
 
     token = request.headers.get("token")
     with token_lock:
-        if data['username'] not in token_table.keys():
+        for t in token_table.values():
+            if token == t.value:
+                token = t
+                break
+        else:
             abort(403)
-        if token != token_table[data['username']].value:
-            abort(403)
-        if token_table[data['username']].is_expired():
-            abort(403)
+
+    if t.is_expired():
+        abort(403)
+
     with con_lock:
         con.execute("INSERT INTO messages(sender, receiver, text, timestamp) VALUES(?, ?, ?, ?)",
                     (data['username'], '', data['text'], int(time.time())))
