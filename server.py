@@ -1,3 +1,4 @@
+import pprint
 import threading
 import uuid
 from flask import Flask
@@ -5,10 +6,10 @@ from cryptography.hazmat.primitives import serialization
 import sqlite3
 from flask import request, abort
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 import json
 import base64
 import time
-from threading import Lock
 
 
 def setup_database(connection: sqlite3.Connection):
@@ -45,7 +46,7 @@ class Token:
         self.username: str = username
 
     def is_expired(self) -> bool:
-        return self.expiration >= self.timestamp
+        return time.time() >= self.expiration
 
 
 con = sqlite3.connect("database.db", check_same_thread=False)
@@ -90,7 +91,7 @@ def register():
         abort(400)
     pass_hash = hash_password(data['password'] + data['username'])
     with con_lock:
-        res = con.execute("SELECT * FROM users WHERE username=?", (data['username'],)).fetchone()
+        res = con.execute("SELECT * FROM users WHERE username=?", (data['username'],))
         if res:
             abort(409)
         con.execute("INSERT INTO users VALUES(?,?,?)", (data['username'], data['public_key'], pass_hash))
@@ -107,7 +108,8 @@ def register():
 def login():
     data: dict = request.get_json(silent=False)
     if ("username" not in data.keys() or
-            "password" not in data.keys()):
+            "password" not in data.keys() or
+            "public_key" not in data.keys()):
         abort(400)
     with con_lock:
         res = con.execute("SELECT * FROM users WHERE username=?", (data['username'],)).fetchone()
@@ -116,15 +118,29 @@ def login():
         pass_hash = hash_password(data['password'] + data['username'])
         if res[2] != pass_hash:
             abort(401)
-        if "public_key" in data.keys():
-            con.execute("UPDATE users SET pub_key=? WHERE username=?",
-                        (data['public_key'], data['username']))
+        con.execute("UPDATE users SET pub_key=? WHERE username=?",
+                    (data['public_key'], data['username']))
         con.commit()
 
     token = Token(3600, data['username'])
     with token_lock:
         token_table[data['username']] = token
-    return json.dumps({'server_generated_public_key': public_key_string, 'token': token.value})
+
+    return json.dumps({'public_key': public_key_string, 'token': token.value})
+
+
+def decrypt_message(text: str):
+    return (
+        private_key.decrypt(
+            base64.b64decode(text),
+            padding.OAEP(
+                mgf=padding.MGF1(
+                    algorithm=hashes.SHA256()
+                ),
+                algorithm=hashes.SHA256(),
+                label=None)
+        ).decode('utf-8')
+    )
 
 
 @app.route("/message", methods=["POST"])
@@ -136,7 +152,7 @@ def send_message():
     if "Authorization" not in request.headers.keys():
         abort(400)
 
-    token = request.headers.get("token")
+    token = request.headers.get("Authorization")
     with token_lock:
         for t in token_table.values():
             if token == t.value:
@@ -149,18 +165,39 @@ def send_message():
         abort(403)
 
     with con_lock:
+        res = con.execute("SELECT * FROM users WHERE username=?", (data['receiver'],))
+        if not res:
+            abort(404)
         con.execute("INSERT INTO messages(sender, receiver, text, timestamp) VALUES(?, ?, ?, ?)",
-                    (data['username'], '', data['text'], int(time.time())))
+                    (data['username'], data['receiver'], data['text'], int(time.time())))
         con.commit()
-    return '', 200
+    return "{'message': 'Message sent successfully'}", 201
+
+
+def encrypt_message(text, p_key):
+    __public_key = serialization.load_pem_public_key(
+        p_key.encode('utf-8')
+    )
+
+    ciphertext = __public_key.encrypt(
+        bytes(text, 'utf-8'),
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+
+    return base64.b64encode(ciphertext).decode('utf-8')
 
 
 @app.route("/", methods=["GET"])
 def get_messages():
-    if "token" not in request.headers.keys():
+    if "Authorization" not in request.headers.keys():
         abort(400)
 
-    token = request.headers.get("token")
+    token = request.headers.get("Authorization")
+
     with token_lock:
         for t in token_table.values():
             if token == t.value:
@@ -174,8 +211,15 @@ def get_messages():
                               (token.username,))
         if not pub_key:
             abort(404)
-        msgs = con.execute("SELECT * FROM messages").fetchall()
+        msgs = con.execute("SELECT * FROM messages WHERE receiver=?",
+                           (token.username, )).fetchall()
 
     pub_key = pub_key.fetchone()[0]
-    print(pub_key)
-    return "Hello message"
+    msg_dict = dict()
+    for msg in msgs:
+        msg_dict[encrypt_message(str(msg[0]), pub_key)] = {'sender': encrypt_message(msg[1], pub_key),
+                                                           'receiver': encrypt_message(msg[2], pub_key),
+                                                           'text': encrypt_message(decrypt_message(msg[3]), pub_key),
+                                                           'timestamp': encrypt_message(str(msg[4]), pub_key)}
+
+    return json.dumps(msg_dict), 200
