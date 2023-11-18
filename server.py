@@ -1,3 +1,4 @@
+import binascii
 import pprint
 import threading
 import uuid
@@ -80,18 +81,25 @@ def hash_password(password):
     return pass_hash
 
 
+def verify_request_data(data, fields):
+    if type(data) is not dict:
+        return False
+    for field in fields:
+        if field not in data.keys() or len(data[field]) == 0:
+            return False
+    return True
+
+
 @app.route("/register", methods=["POST"])
 def register():
     data: dict | str = request.get_json(silent=False)
     if type(dict) is str:
         data = json.loads(data)
-    if ("username" not in data.keys() or
-            "password" not in data.keys() or
-            "public_key" not in data.keys()):
+    if not verify_request_data(data, ("username", "password", "public_key")):
         abort(400)
     pass_hash = hash_password(data['password'] + data['username'])
     with con_lock:
-        res = con.execute("SELECT * FROM users WHERE username=?", (data['username'],))
+        res = con.execute("SELECT * FROM users WHERE username=?", (data['username'],)).fetchall()
         if res:
             abort(409)
         con.execute("INSERT INTO users VALUES(?,?,?)", (data['username'], data['public_key'], pass_hash))
@@ -107,9 +115,7 @@ def register():
 @app.route("/login", methods=["POST"])
 def login():
     data: dict = request.get_json(silent=False)
-    if ("username" not in data.keys() or
-            "password" not in data.keys() or
-            "public_key" not in data.keys()):
+    if not verify_request_data(data, ("username", "password", "public_key")):
         abort(400)
     with con_lock:
         res = con.execute("SELECT * FROM users WHERE username=?", (data['username'],)).fetchone()
@@ -146,9 +152,9 @@ def decrypt_message(text: str):
 @app.route("/message", methods=["POST"])
 def send_message():
     data: dict = request.get_json(silent=False)
-    if ("receiver" not in data.keys() or
-            "text" not in data.keys()):
+    if not verify_request_data(data, ("receiver", "text")):
         abort(400)
+
     if "Authorization" not in request.headers.keys():
         abort(400)
 
@@ -164,12 +170,21 @@ def send_message():
     if t.is_expired():
         abort(403)
 
+    try:
+        decrypt_message(data['text'])
+    except binascii.Error:
+        abort(422)
+    except TypeError:
+        abort(422)
+    except ValueError:
+        abort(422)
+
     with con_lock:
-        res = con.execute("SELECT * FROM users WHERE username=?", (data['receiver'],))
+        res = con.execute("SELECT * FROM users WHERE username=?", (data['receiver'],)).fetchall()
         if not res:
             abort(404)
         con.execute("INSERT INTO messages(sender, receiver, text, timestamp) VALUES(?, ?, ?, ?)",
-                    (data['username'], data['receiver'], data['text'], int(time.time())))
+                    (token.username, data['receiver'], data['text'], int(time.time())))
         con.commit()
     return "{'message': 'Message sent successfully'}", 201
 
@@ -211,8 +226,8 @@ def get_messages():
                               (token.username,))
         if not pub_key:
             abort(404)
-        msgs = con.execute("SELECT * FROM messages WHERE receiver=?",
-                           (token.username, )).fetchall()
+        msgs = con.execute("SELECT * FROM messages WHERE receiver=? OR sender=?",
+                           (token.username, token.username)).fetchall()
 
     pub_key = pub_key.fetchone()[0]
     msg_dict = dict()
